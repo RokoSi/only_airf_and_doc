@@ -16,7 +16,7 @@ settings = Settings()
 
 if __name__ == "__main__":
     print(settings)
-#     import os 
+#     import os
 #     file_name = '.env.dev'
 #     directories = ['.', '..', '../src']
 #     for directory in directories:

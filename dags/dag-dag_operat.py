@@ -1,13 +1,10 @@
+import csv
 import logging
 import os
 from datetime import datetime
-from pprint import pprint
-
 from airflow import DAG
-from airflow.operators.python import PythonOperator, BranchPythonOperator
-from airflow.providers.http.operators.http import SimpleHttpOperator
+from airflow.operators.python import PythonOperator
 from airflow.providers.postgres.operators.postgres import PostgresOperator
-from validators import validator_email, validator_pass
 
 log_dir = os.path.join(os.getcwd(), "logs")
 log_file = os.path.join(log_dir, "logfile.log")
@@ -23,26 +20,198 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-def validate_data_users(ti):
-    users = ti.xcom_pull(task_ids="get_request")
-    if not users:
-        raise ValueError("Нет данных для обработки")
-    users_db = []
+def get_user(**kwargs):
+
+    from get_user import get_users_url
+
+    from airflow.models import Variable
+
+    users = get_users_url(1, Variable.get("url"))
+    file_path = os.path.join("./ods", "users_data.csv")
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    with open(file_path, "w", newline="") as csvfile:
+        fieldnames = [
+            "gender",
+            "name_title",
+            "name_first",
+            "name_last",
+            "age",
+            "nat",
+            "email",
+            "username",
+            "password",
+            "password_md5",
+            "valid",
+            "city",
+            "state",
+            "country",
+            "street_name",
+            "street_number",
+            "postcode",
+            "latitude",
+            "longitude",
+            "phone",
+            "cell",
+            "picture",
+        ]
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+
+        for user in users:
+            writer.writerow(
+                {
+                    "gender": user["gender"],
+                    "name_title": user["name"]["title"],
+                    "name_first": user["name"]["first"],
+                    "name_last": user["name"]["last"],
+                    "age": user["dob"]["age"],
+                    "nat": user["nat"],
+                    "email": user["email"],
+                    "username": user["login"]["username"],
+                    "password": user["login"]["password"],
+                    "password_md5": user["login"]["md5"],
+                    "valid": None,  # поле valid нужно будет заполнять позже в процессе валидации
+                    "city": user["location"]["city"],
+                    "state": user["location"]["state"],
+                    "country": user["location"]["country"],
+                    "street_name": user["location"]["street"]["name"],
+                    "street_number": user["location"]["street"]["number"],
+                    "postcode": user["location"]["postcode"],
+                    "latitude": user["location"]["coordinates"]["latitude"],
+                    "longitude": user["location"]["coordinates"]["longitude"],
+                    "phone": user["phone"],
+                    "cell": user["cell"],
+                    "picture": user["picture"]["large"],
+                }
+            )
+
+    kwargs["ti"].xcom_push(key="users_csv_file", value=file_path)
+
+
+def read_from_csv(ti):
+    from validators import validator_pass
+
+
+    file_path = ti.xcom_pull(task_ids="get_user", key="users_csv_file")
+
+    if not file_path or not os.path.exists(file_path):
+        print("путь к файлу:", ti.xcom_pull(task_ids="save_data_to_csv", key="users_csv_file"))
+        raise ValueError(f"Файл {file_path} не найден или не указан")
+
+    users = []
+
+    # Чтение данных из CSV файла
+    with open(file_path, "r") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            users.append(row)
+
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+    pg_hook = PostgresHook(postgres_conn_id="postgres_connection")
+    conn = pg_hook.get_conn()
+    cursor = conn.cursor()
+
     for user in users:
-        if validator_email(user["email"]):
-            valid_password = validator_pass(user["login"]["password"])
-            user["valid"] = valid_password
-            users_db.append(user)
-        else:
-            raise Exception("невалидный email")
+        from pprint import pprint
 
-    ti.xcom_push(key="validated_users", value=users_db)
+        pprint(user)
 
+        # Вставка в таблицу users
+        cursor.execute(
+            """
+            INSERT INTO users (gender, name_title, name_first, name_last, age, nat)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING user_id
+        """,
+            (
 
-check_tables_query = """
-SELECT COUNT(*) FROM pg_catalog.pg_tables
-WHERE schemaname NOT IN ('pg_catalog', 'information_schema');
-"""
+                user["gender"],
+                user["name_title"],
+                user["name_first"],
+                user["name_last"],
+                user["age"],
+                user["nat"],
+            ),
+        )
+        user_id = cursor.fetchone()[0]
+
+        # Вставка в таблицу cities
+        cursor.execute(
+            """
+            INSERT INTO cities (city, state, country)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (city, state, country) DO NOTHING
+            RETURNING city_id
+        """,
+            (
+
+                user["city"],
+                user["state"],
+                user["country"],
+            ),
+        )
+        city_id = cursor.fetchone()[0] if cursor.rowcount > 0 else None
+
+        # Вставка в таблицу contact_details
+        cursor.execute(
+            """
+            INSERT INTO contact_details (user_id, phone, cell)
+            VALUES (%s, %s, %s)
+        """,
+            (user_id,
+             user["phone"],
+             user["cell"]),
+        )
+
+        # Вставка в таблицу media_data
+        cursor.execute(
+            """
+            INSERT INTO media_data (user_id, picture)
+            VALUES (%s, %s)
+        """,
+            (user_id, user["picture"]),
+        )
+
+        # Вставка в таблицу registration_data
+        cursor.execute(
+            """
+            INSERT INTO registration_data (user_id, email, username, password, password_md5, password_validation)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """,
+            (
+
+                user_id,
+                user["email"],
+                user["username"],
+                user["password"],
+                user["password_md5"],
+                validator_pass(user["password"]),
+            ),
+        )
+
+        # Вставка в таблицу locations
+        cursor.execute(
+            """
+            INSERT INTO locations (user_id, city_id, street_name, street_number, postcode, latitude, longitude)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """,
+            (
+
+                user_id,
+                city_id,
+                user["street_name"],
+                user["street_number"],
+                user["postcode"],
+                user["latitude"],
+                user["longitude"],
+            ),
+        )
+
+    conn.commit()
+    cursor.close()
+
 
 ddl: str = """
 
@@ -120,89 +289,9 @@ CREATE table if not EXISTS locations(
 );"""
 
 
-def save_to_postgres(ti):
-    users = ti.xcom_pull(task_ids="validator_data_users", key="validated_users")
-    if not users:
-        raise ValueError("Нет данных для вставки в базу данных")
-
-    from airflow.providers.postgres.hooks.postgres import PostgresHook
-
-    pg_hook = PostgresHook(postgres_conn_id='postgres_connection')
-    conn = pg_hook.get_conn()
-    cursor = conn.cursor()
-
-    for user in users:
-        pprint(user)
-
-        # Вставка в таблицу users
-        cursor.execute("""
-            INSERT INTO users (gender, name_title, name_first, name_last, age, nat)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING user_id
-        """, (
-            user['gender'], user['name']['title'], user['name']['first'], user['name']['last'], user['dob']['age'], user['nat']
-        ))
-        user_id = cursor.fetchone()[0]
-
-        # Вставка в таблицу cities
-        cursor.execute("""
-            INSERT INTO cities (city, state, country)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (city, state, country) DO NOTHING
-            RETURNING city_id
-        """, (
-            user['location']['city'], user['location']['state'], user['location']['country']
-        ))
-        city_id = cursor.fetchone()[0] if cursor.rowcount > 0 else None
-
-        # Вставка в таблицу contact_details
-        cursor.execute("""
-            INSERT INTO contact_details (user_id, phone, cell)
-            VALUES (%s, %s, %s)
-        """, (
-            user_id, user['phone'], user['cell']
-        ))
-
-        # Вставка в таблицу media_data
-        cursor.execute("""
-            INSERT INTO media_data (user_id, picture)
-            VALUES (%s, %s)
-        """, (
-            user_id, user['picture']['large']
-        ))
-
-        # Вставка в таблицу registration_data
-        cursor.execute("""
-            INSERT INTO registration_data (user_id, email, username, password, password_md5, password_validation)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """, (
-            user_id, user['email'], user['login']['username'], user['login']['password'], user['login']['md5'], user['valid']
-        ))
-
-        # Вставка в таблицу locations
-        cursor.execute("""
-            INSERT INTO locations (user_id, city_id, street_name, street_number, postcode, latitude, longitude)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """, (
-            user_id, city_id, user['location']['street']['name'], user['location']['street']['number'], user['location']['postcode'],
-            user['location']['coordinates']['latitude'], user['location']['coordinates']['longitude']
-        ))
-
-    conn.commit()
-    cursor.close()
 
 
 
-
-def decide_next_task(**kwargs):
-    ti = kwargs["ti"]
-    result = ti.xcom_pull(task_ids="check_tables")
-    log.info(f"Result from check_tables: {result}")
-    if result and result[0][0] == 0:
-        log.info("No tables found, returning create_tables")
-        return "create_tables"
-    log.info("Tables exist, returning fill_tables")
-    return "fill_tables"
 
 
 args = {
@@ -219,33 +308,10 @@ with DAG(
     catchup=False,  # TODO
     default_args=args,
 ) as dag:
-    get_request = SimpleHttpOperator(
-        task_id="get_request",
-        http_conn_id="http_default",
-        endpoint="",
-        method="GET",
-        response_filter=lambda response: response.json().get("results", []),
-        log_response=True,
-        dag=dag,
-    )
 
-    validator_data_users = PythonOperator(
-        task_id="validator_data_users",
-        python_callable=validate_data_users,
-    )
-
-    # branch_op = BranchPythonOperator(
-    #     task_id="decide_next_task",
-    #     python_callable=decide_next_task,
-    #     provide_context=True,
-    #     dag=dag,
-    # )
-
-    check_tables = PostgresOperator(
-        task_id="check_tables",
-        postgres_conn_id="postgres_connection",
-        sql=check_tables_query,
-        dag=dag,
+    get_users = PythonOperator(
+        task_id="get_user",
+        python_callable=get_user,
     )
 
     create_tables = PostgresOperator(
@@ -255,40 +321,10 @@ with DAG(
         dag=dag,
     )
 
-    # fill_tables = PostgresOperator(
-    #     task_id="fill_tables",
-    #     postgres_conn_id="postgres_connection",
-    #     sql="""{% for user in ti.xcom_pull(task_ids='validator_data_users', key='validated_users') %}
-    #     WITH ins AS (
-    #         INSERT INTO users (gender, name_title, name_first, name_last, age, nat)
-    #         VALUES (%s, %s, %s, %s, %s, %s)
-    #         RETURNING user_id
-    #     ),
-    #     ins_city AS (
-    #         INSERT INTO cities (city, state, country)
-    #         VALUES (%s, %s, %s)
-    #         ON CONFLICT (city, state, country) DO NOTHING
-    #         RETURNING city_id
-    #     )
-    #     INSERT INTO contact_details (user_id, phone, cell)
-    #     VALUES ((SELECT user_id FROM ins),%s,%s);
-    #
-    #     INSERT INTO media_data (user_id, picture)
-    #     VALUES ((SELECT user_id FROM ins), %s);
-    #
-    #     INSERT INTO registration_data (user_id, email, username, password, password_md5, password_validation)
-    #     VALUES ((SELECT user_id FROM ins), %s, %s, %s, %s, %s);
-    #
-    #     INSERT INTO locations (user_id, city_id, street_name, street_number, postcode, latitude, longitude)
-    #     VALUES ((SELECT user_id FROM ins), (SELECT city_id FROM ins_city), %s, %s, %s, %s, %s);
-    #     {% endfor %}
-    #     """,
-    #     dag=dag,
-    # )
-    save_data = PythonOperator(
-        task_id="save_data_to_postgres",
-        python_callable=save_to_postgres,
+
+save_data = PythonOperator(
+    task_id="save_data_to_postgres",
+    python_callable=read_from_csv,
     )
 
-get_request >> validator_data_users >> create_tables >> save_data
-
+get_users >> create_tables >> save_data
