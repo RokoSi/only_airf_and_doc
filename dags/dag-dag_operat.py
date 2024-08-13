@@ -1,6 +1,8 @@
 import logging
 import os
 from datetime import datetime
+from pprint import pprint
+
 from airflow import DAG
 from airflow.operators.python import PythonOperator, BranchPythonOperator
 from airflow.providers.http.operators.http import SimpleHttpOperator
@@ -19,16 +21,6 @@ logging.basicConfig(
     datefmt="%d/%m/%Y %I:%M:%S %p",
 )
 log = logging.getLogger(__name__)
-
-
-# def fetch_users_from_api(**kwargs):
-#     count_users = kwargs.get('count_users', 10)
-#     users = get_users_url(count_users, settings)
-#     if users:
-#         # Сохранение результатов в XCom для использования в следующих задачах
-#         return users
-#     else:
-#         raise ValueError("Не удалось получить пользователей из API")
 
 
 def validate_data_users(ti):
@@ -128,6 +120,80 @@ CREATE table if not EXISTS locations(
 );"""
 
 
+def save_to_postgres(ti):
+    users = ti.xcom_pull(task_ids="validator_data_users", key="validated_users")
+    if not users:
+        raise ValueError("Нет данных для вставки в базу данных")
+
+    from airflow.providers.postgres.hooks.postgres import PostgresHook
+
+    pg_hook = PostgresHook(postgres_conn_id='postgres_connection')
+    conn = pg_hook.get_conn()
+    cursor = conn.cursor()
+
+    for user in users:
+        pprint(user)
+
+        # Вставка в таблицу users
+        cursor.execute("""
+            INSERT INTO users (gender, name_title, name_first, name_last, age, nat)
+            VALUES (%s, %s, %s, %s, %s, %s)
+            RETURNING user_id
+        """, (
+            user['gender'], user['name']['title'], user['name']['first'], user['name']['last'], user['dob']['age'], user['nat']
+        ))
+        user_id = cursor.fetchone()[0]
+
+        # Вставка в таблицу cities
+        cursor.execute("""
+            INSERT INTO cities (city, state, country)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (city, state, country) DO NOTHING
+            RETURNING city_id
+        """, (
+            user['location']['city'], user['location']['state'], user['location']['country']
+        ))
+        city_id = cursor.fetchone()[0] if cursor.rowcount > 0 else None
+
+        # Вставка в таблицу contact_details
+        cursor.execute("""
+            INSERT INTO contact_details (user_id, phone, cell)
+            VALUES (%s, %s, %s)
+        """, (
+            user_id, user['phone'], user['cell']
+        ))
+
+        # Вставка в таблицу media_data
+        cursor.execute("""
+            INSERT INTO media_data (user_id, picture)
+            VALUES (%s, %s)
+        """, (
+            user_id, user['picture']['large']
+        ))
+
+        # Вставка в таблицу registration_data
+        cursor.execute("""
+            INSERT INTO registration_data (user_id, email, username, password, password_md5, password_validation)
+            VALUES (%s, %s, %s, %s, %s, %s)
+        """, (
+            user_id, user['email'], user['login']['username'], user['login']['password'], user['login']['md5'], user['valid']
+        ))
+
+        # Вставка в таблицу locations
+        cursor.execute("""
+            INSERT INTO locations (user_id, city_id, street_name, street_number, postcode, latitude, longitude)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+        """, (
+            user_id, city_id, user['location']['street']['name'], user['location']['street']['number'], user['location']['postcode'],
+            user['location']['coordinates']['latitude'], user['location']['coordinates']['longitude']
+        ))
+
+    conn.commit()
+    cursor.close()
+
+
+
+
 def decide_next_task(**kwargs):
     ti = kwargs["ti"]
     result = ti.xcom_pull(task_ids="check_tables")
@@ -147,7 +213,7 @@ args = {
     # 'provide_context': True
 }
 with DAG(
-    "test_de",
+    "test_de_airf",
     description="test1",
     schedule_interval="*/1 * * * *",
     catchup=False,  # TODO
@@ -168,12 +234,12 @@ with DAG(
         python_callable=validate_data_users,
     )
 
-    branch_op = BranchPythonOperator(
-        task_id="decide_next_task",
-        python_callable=decide_next_task,
-        provide_context=True,
-        dag=dag,
-    )
+    # branch_op = BranchPythonOperator(
+    #     task_id="decide_next_task",
+    #     python_callable=decide_next_task,
+    #     provide_context=True,
+    #     dag=dag,
+    # )
 
     check_tables = PostgresOperator(
         task_id="check_tables",
@@ -182,7 +248,6 @@ with DAG(
         dag=dag,
     )
 
-    # Задача для создания таблиц
     create_tables = PostgresOperator(
         task_id="create_tables",
         postgres_conn_id="postgres_connection",
@@ -190,41 +255,40 @@ with DAG(
         dag=dag,
     )
 
-    fill_tables = PostgresOperator(
-        task_id="fill_tables",
-        postgres_conn_id="postgres_connection",
-        sql="""{% for user in ti.xcom_pull(task_ids='validator_data_users', key='validated_users') %}
-        WITH ins AS (
-            INSERT INTO users (gender, name_title, name_first, name_last, age, nat)
-            VALUES (%s, %s, %s, %s, %s, %s)
-            RETURNING user_id
-        ),
-        ins_city AS (
-            INSERT INTO cities (city, state, country)
-            VALUES (%s, %s, %s) 
-            ON CONFLICT (city, state, country) DO NOTHING
-            RETURNING city_id
-        )
-        INSERT INTO contact_details (user_id, phone, cell)
-        VALUES ((SELECT user_id FROM ins),%s,%s);
-
-        INSERT INTO media_data (user_id, picture)
-        VALUES ((SELECT user_id FROM ins), %s);
-
-        INSERT INTO registration_data (user_id, email, username, password, password_md5, password_validation)
-        VALUES ((SELECT user_id FROM ins), %s, %s, %s, %s, %s);
-
-        INSERT INTO locations (user_id, city_id, street_name, street_number, postcode, latitude, longitude)
-        VALUES ((SELECT user_id FROM ins), (SELECT city_id FROM ins_city), %s, %s, %s, %s, %s);
-        {% endfor %}
-        """,
-        dag=dag,
+    # fill_tables = PostgresOperator(
+    #     task_id="fill_tables",
+    #     postgres_conn_id="postgres_connection",
+    #     sql="""{% for user in ti.xcom_pull(task_ids='validator_data_users', key='validated_users') %}
+    #     WITH ins AS (
+    #         INSERT INTO users (gender, name_title, name_first, name_last, age, nat)
+    #         VALUES (%s, %s, %s, %s, %s, %s)
+    #         RETURNING user_id
+    #     ),
+    #     ins_city AS (
+    #         INSERT INTO cities (city, state, country)
+    #         VALUES (%s, %s, %s)
+    #         ON CONFLICT (city, state, country) DO NOTHING
+    #         RETURNING city_id
+    #     )
+    #     INSERT INTO contact_details (user_id, phone, cell)
+    #     VALUES ((SELECT user_id FROM ins),%s,%s);
+    #
+    #     INSERT INTO media_data (user_id, picture)
+    #     VALUES ((SELECT user_id FROM ins), %s);
+    #
+    #     INSERT INTO registration_data (user_id, email, username, password, password_md5, password_validation)
+    #     VALUES ((SELECT user_id FROM ins), %s, %s, %s, %s, %s);
+    #
+    #     INSERT INTO locations (user_id, city_id, street_name, street_number, postcode, latitude, longitude)
+    #     VALUES ((SELECT user_id FROM ins), (SELECT city_id FROM ins_city), %s, %s, %s, %s, %s);
+    #     {% endfor %}
+    #     """,
+    #     dag=dag,
+    # )
+    save_data = PythonOperator(
+        task_id="save_data_to_postgres",
+        python_callable=save_to_postgres,
     )
 
-get_request >> validator_data_users >> create_tables >> fill_tables
+get_request >> validator_data_users >> create_tables >> save_data
 
-# get_request >> validator_data_users
-# validator_data_users >> check_tables
-# check_tables >> branch_op
-# branch_op >> create_tables >> fill_tables
-# branch_op >> fill_tables
