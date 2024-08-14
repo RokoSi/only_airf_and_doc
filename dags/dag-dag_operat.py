@@ -21,7 +21,6 @@ log = logging.getLogger(__name__)
 
 
 def get_user(**kwargs):
-
     from get_user import get_users_url
 
     from airflow.models import Variable
@@ -71,7 +70,7 @@ def get_user(**kwargs):
                     "username": user["login"]["username"],
                     "password": user["login"]["password"],
                     "password_md5": user["login"]["md5"],
-                    "valid": None,  # поле valid нужно будет заполнять позже в процессе валидации
+                    "valid": True,
                     "city": user["location"]["city"],
                     "state": user["location"]["state"],
                     "country": user["location"]["country"],
@@ -92,7 +91,6 @@ def get_user(**kwargs):
 def read_from_csv(ti):
     from validators import validator_pass
 
-
     file_path = ti.xcom_pull(task_ids="get_user", key="users_csv_file")
 
     if not file_path or not os.path.exists(file_path):
@@ -101,7 +99,6 @@ def read_from_csv(ti):
 
     users = []
 
-    # Чтение данных из CSV файла
     with open(file_path, "r") as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
@@ -117,8 +114,6 @@ def read_from_csv(ti):
         from pprint import pprint
 
         pprint(user)
-
-        # Вставка в таблицу users
         cursor.execute(
             """
             INSERT INTO users (gender, name_title, name_first, name_last, age, nat)
@@ -154,7 +149,6 @@ def read_from_csv(ti):
         )
         city_id = cursor.fetchone()[0] if cursor.rowcount > 0 else None
 
-        # Вставка в таблицу contact_details
         cursor.execute(
             """
             INSERT INTO contact_details (user_id, phone, cell)
@@ -165,7 +159,6 @@ def read_from_csv(ti):
              user["cell"]),
         )
 
-        # Вставка в таблицу media_data
         cursor.execute(
             """
             INSERT INTO media_data (user_id, picture)
@@ -174,7 +167,6 @@ def read_from_csv(ti):
             (user_id, user["picture"]),
         )
 
-        # Вставка в таблицу registration_data
         cursor.execute(
             """
             INSERT INTO registration_data (user_id, email, username, password, password_md5, password_validation)
@@ -191,7 +183,6 @@ def read_from_csv(ti):
             ),
         )
 
-        # Вставка в таблицу locations
         cursor.execute(
             """
             INSERT INTO locations (user_id, city_id, street_name, street_number, postcode, latitude, longitude)
@@ -288,12 +279,6 @@ CREATE table if not EXISTS locations(
     FOREIGN KEY (city_id) REFERENCES cities(city_id)
 );"""
 
-
-
-
-
-
-
 args = {
     "owner": "Chernyshev-Pridvorov",
     "depends_on_past": False,
@@ -302,13 +287,12 @@ args = {
     # 'provide_context': True
 }
 with DAG(
-    "test_de_airf",
-    description="test1",
-    schedule_interval="*/1 * * * *",
-    catchup=False,  # TODO
-    default_args=args,
+        "test_de_airf",
+        description="test1",
+        schedule_interval="*/1 * * * *",
+        catchup=False,  # TODO
+        default_args=args,
 ) as dag:
-
     get_users = PythonOperator(
         task_id="get_user",
         python_callable=get_user,
@@ -321,10 +305,9 @@ with DAG(
         dag=dag,
     )
 
-
 save_data = PythonOperator(
     task_id="save_data_to_postgres",
     python_callable=read_from_csv,
-    )
+)
 
 get_users >> create_tables >> save_data
