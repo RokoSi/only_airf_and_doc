@@ -4,7 +4,6 @@ import os
 from datetime import datetime
 from airflow import DAG
 from airflow.operators.python import PythonOperator
-from airflow.providers.postgres.operators.postgres import PostgresOperator
 
 log_dir = os.path.join(os.getcwd(), "logs")
 log_file = os.path.join(log_dir, "logfile.log")
@@ -26,7 +25,7 @@ def get_user(**kwargs):
     from airflow.models import Variable
 
     users = get_users_url(1, Variable.get("url"))
-    file_path = os.path.join("./ods", "users_data.csv")
+    file_path = os.path.join("./ods", "raw_data.csv")
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
 
     with open(file_path, "w", newline="") as csvfile:
@@ -85,21 +84,40 @@ def get_user(**kwargs):
                 }
             )
 
-    kwargs["ti"].xcom_push(key="users_csv_file", value=file_path)
+    kwargs["ti"].xcom_push(key="raw_csv_file", value=file_path)
 
 
 def read_from_csv(ti):
-    from validators import validator_pass
-
-    file_path = ti.xcom_pull(task_ids="get_user", key="users_csv_file")
-
-    if not file_path or not os.path.exists(file_path):
-        print("путь к файлу:", ti.xcom_pull(task_ids="save_data_to_csv", key="users_csv_file"))
-        raise ValueError(f"Файл {file_path} не найден или не указан")
+    raw_file_path = ti.xcom_pull(task_ids="get_user", key="raw_csv_file")
+    ods_file_path = os.path.join("./ods", "ods_data.csv")
+    os.makedirs(os.path.dirname(ods_file_path), exist_ok=True)
 
     users = []
 
-    with open(file_path, "r") as csvfile:
+    with open(raw_file_path, "r") as csvfile:
+        reader = csv.DictReader(csvfile)
+        for row in reader:
+            from validators import validator_pass
+            row["valid"] = validator_pass(row)
+            users.append(row)
+
+    with open(ods_file_path, "w", newline="") as csvfile:
+        fieldnames = users[0].keys()
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(users)
+
+        ti.xcom_push(key="ods_csv_file", value=ods_file_path)
+
+
+def save_data_to_postgres(ti):
+    ods_file_path = ti.xcom_pull(task_ids="read_csv_save_ods", key="ods_csv_file")
+
+    if not ods_file_path or not os.path.exists(ods_file_path):
+        raise ValueError(f"Файл {ods_file_path} не найден или не указан")
+
+    users = []
+    with open(ods_file_path, "r") as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
             users.append(row)
@@ -111,17 +129,28 @@ def read_from_csv(ti):
     cursor = conn.cursor()
 
     for user in users:
-        from pprint import pprint
+        try:
+            cursor.execute(
+                """INSERT INTO cities(city, state, country)
+            VALUES (%s, %s, %s ) RETURNING city_id"""
+            , (
+                user["city"],
+                user["state"],
+                user["country"],
+            )
+            )
 
-        pprint(user)
+            city_id = cursor.fetchone()[0]
+        except Exception as e:
+            print(f"Ошибка: {e}")
+
         cursor.execute(
             """
             INSERT INTO users (gender, name_title, name_first, name_last, age, nat)
             VALUES (%s, %s, %s, %s, %s, %s)
             RETURNING user_id
-        """,
+            """,
             (
-
                 user["gender"],
                 user["name_title"],
                 user["name_first"],
@@ -132,38 +161,19 @@ def read_from_csv(ti):
         )
         user_id = cursor.fetchone()[0]
 
-        # Вставка в таблицу cities
-        cursor.execute(
-            """
-            INSERT INTO cities (city, state, country)
-            VALUES (%s, %s, %s)
-            ON CONFLICT (city, state, country) DO NOTHING
-            RETURNING city_id
-        """,
-            (
-
-                user["city"],
-                user["state"],
-                user["country"],
-            ),
-        )
-        city_id = cursor.fetchone()[0] if cursor.rowcount > 0 else None
-
         cursor.execute(
             """
             INSERT INTO contact_details (user_id, phone, cell)
             VALUES (%s, %s, %s)
-        """,
-            (user_id,
-             user["phone"],
-             user["cell"]),
+            """,
+            (user_id, user["phone"], user["cell"]),
         )
 
         cursor.execute(
             """
             INSERT INTO media_data (user_id, picture)
             VALUES (%s, %s)
-        """,
+            """,
             (user_id, user["picture"]),
         )
 
@@ -171,15 +181,14 @@ def read_from_csv(ti):
             """
             INSERT INTO registration_data (user_id, email, username, password, password_md5, password_validation)
             VALUES (%s, %s, %s, %s, %s, %s)
-        """,
+            """,
             (
-
                 user_id,
                 user["email"],
                 user["username"],
                 user["password"],
                 user["password_md5"],
-                validator_pass(user["password"]),
+                user["valid"],
             ),
         )
 
@@ -187,9 +196,8 @@ def read_from_csv(ti):
             """
             INSERT INTO locations (user_id, city_id, street_name, street_number, postcode, latitude, longitude)
             VALUES (%s, %s, %s, %s, %s, %s, %s)
-        """,
+            """,
             (
-
                 user_id,
                 city_id,
                 user["street_name"],
@@ -203,81 +211,6 @@ def read_from_csv(ti):
     conn.commit()
     cursor.close()
 
-
-ddl: str = """
-
-    CREATE table if not EXISTS users(
-    user_id      INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    gender       VARCHAR(255),
-    name_title   VARCHAR(255),
-    name_first   VARCHAR(255),
-    name_last    VARCHAR(255),
-    age 		 INT,
-    nat          VARCHAR(255),
-    created_dttm TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_dttm TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-   );
-
--- Создание таблицы contact_details
-CREATE table if not EXISTS contact_details(
-    user_id      INT NOT NULL,
-    phone        VARCHAR(255),
-    cell         VARCHAR(255),
-    created_dttm TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_dttm TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
-
--- Создание таблицы media_data
-CREATE table if not EXISTS media_data(
-    user_id         INT NOT NULL,
-    picture         VARCHAR(255),
-    created_dttm    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_dttm    TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
-CREATE table if not EXISTS registration_data(
-    user_id             INT NOT NULL,
-    email               VARCHAR(255),
-    username            VARCHAR(255),
-    password            VARCHAR(255),
-    password_md5        VARCHAR(255),
-    password_validation BOOLEAN,
-    created_dttm        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_dttm        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (user_id) REFERENCES users(user_id)
-);
-
--- Создание таблицы cities
-CREATE table if not EXISTS cities(
-    city_id 	 INT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
-    city 		 VARCHAR(255),
-    state 		 VARCHAR(255),
-    country 	 VARCHAR(255),
-    created_dttm TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_dttm TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    CONSTRAINT unique_city_state_country UNIQUE (city,state,country)
-
-);
-
--- Создание таблицы locations
-CREATE table if not EXISTS locations(
-    user_id       INT NOT NULL,
-    city_id       INT NOT NULL,
-    street_name   VARCHAR(255),
-    street_number INT,
-    postcode      VARCHAR(255),
-    latitude      FLOAT,
-    longitude     FLOAT,
-    created_dttm  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-    updated_dttm  TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-
-    FOREIGN KEY (user_id) REFERENCES users(user_id),
-    FOREIGN KEY (city_id) REFERENCES cities(city_id)
-);"""
 
 args = {
     "owner": "Chernyshev-Pridvorov",
@@ -298,16 +231,13 @@ with DAG(
         python_callable=get_user,
     )
 
-    create_tables = PostgresOperator(
-        task_id="create_tables",
-        postgres_conn_id="postgres_connection",
-        sql=ddl,
-        dag=dag,
+    read_and_save_csv = PythonOperator(
+        task_id="read_csv_save_ods",
+        python_callable=read_from_csv,
+    )
+    save_data = PythonOperator(
+        task_id="save_data_to_postgres",
+        python_callable=save_data_to_postgres,
     )
 
-save_data = PythonOperator(
-    task_id="save_data_to_postgres",
-    python_callable=read_from_csv,
-)
-
-get_users >> create_tables >> save_data
+get_users >> read_and_save_csv >> save_data
