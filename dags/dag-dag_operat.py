@@ -25,8 +25,14 @@ def get_user(**kwargs):
     from airflow.models import Variable
 
     users = get_users_url(1, Variable.get("url"))
-    file_path = os.path.join("./ods", "raw_data.csv")
+    file_path = os.path.join("./dags/data/", "raw_data.csv")
     os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
+    existing_data = []
+    if os.path.exists(file_path):
+        with open(file_path, "r") as csvfile:
+            reader = csv.DictReader(csvfile)
+            existing_data = list(reader)
 
     with open(file_path, "w", newline="") as csvfile:
         fieldnames = [
@@ -55,6 +61,9 @@ def get_user(**kwargs):
         ]
         writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
         writer.writeheader()
+
+        for row in existing_data:
+            writer.writerow(row)
 
         for user in users:
             writer.writerow(
@@ -89,23 +98,51 @@ def get_user(**kwargs):
 
 def read_from_csv(ti):
     raw_file_path = ti.xcom_pull(task_ids="get_user", key="raw_csv_file")
-    ods_file_path = os.path.join("./ods", "ods_data.csv")
+    ods_file_path = os.path.join("./dags/data/", "ods_data.csv")
     os.makedirs(os.path.dirname(ods_file_path), exist_ok=True)
 
     users = []
 
-    with open(raw_file_path, "r") as csvfile:
-        reader = csv.DictReader(csvfile)
-        for row in reader:
-            from validators import validator_pass
-            row["valid"] = validator_pass(row)
-            users.append(row)
+    if os.path.exists(raw_file_path):
+        with open(raw_file_path, "r") as csvfile:
+            reader = csv.DictReader(csvfile)
+            users = list(reader)
+
+    last_users = {}
+    for user in users:
+        key = (user["email"], user["username"])
+        from validators import validator_pass
+
+        user["valid"] = validator_pass(user["password"])
+        last_users[key] = user
 
     with open(ods_file_path, "w", newline="") as csvfile:
-        fieldnames = users[0].keys()
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        writer.writeheader()
-        writer.writerows(users)
+        if last_users:
+            fieldnames = list(last_users.values())[0].keys()
+            writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+            writer.writeheader()
+            writer.writerows(last_users.values())
+
+        # users = []
+        #
+        # if os.path.exists(raw_file_path):
+        #     with open(raw_file_path, "r") as csvfile:
+        #         reader = csv.DictReader(csvfile)
+        #         users = list(reader)
+        #
+        #
+        # with open(raw_file_path, "r") as csvfile:
+        #     reader = csv.DictReader(csvfile)
+        #     for row in reader:
+        #         from validators import validator_pass
+        #         row["valid"] = validator_pass(row)
+        #         users.append(row)
+        #
+        # with open(ods_file_path, "w", newline="") as csvfile:
+        #     fieldnames = users[0].keys()
+        #     writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        #     writer.writeheader()
+        #     writer.writerows(users)
 
         ti.xcom_push(key="ods_csv_file", value=ods_file_path)
 
@@ -116,11 +153,22 @@ def save_data_to_postgres(ti):
     if not ods_file_path or not os.path.exists(ods_file_path):
         raise ValueError(f"Файл {ods_file_path} не найден или не указан")
 
-    users = []
+    last_users = {}
     with open(ods_file_path, "r") as csvfile:
         reader = csv.DictReader(csvfile)
         for row in reader:
-            users.append(row)
+            key = (row["email"], row["username"])
+            last_users[key] = row
+
+    if not last_users:
+        raise ValueError(f"Файл {ods_file_path} не содержит данных")
+
+    users = list(last_users.values())
+    user = users[-1]
+
+    from pprint import pprint
+
+    pprint(user)
 
     from airflow.providers.postgres.hooks.postgres import PostgresHook
 
@@ -128,21 +176,18 @@ def save_data_to_postgres(ti):
     conn = pg_hook.get_conn()
     cursor = conn.cursor()
 
-    for user in users:
-        try:
-            cursor.execute(
-                """INSERT INTO cities(city, state, country)
-            VALUES (%s, %s, %s ) RETURNING city_id"""
-            , (
+    try:
+        cursor.execute(
+            """INSERT INTO cities(city, state, country)
+            VALUES (%s, %s, %s ) RETURNING city_id""",
+            (
                 user["city"],
                 user["state"],
                 user["country"],
-            )
-            )
+            ),
+        )
 
-            city_id = cursor.fetchone()[0]
-        except Exception as e:
-            print(f"Ошибка: {e}")
+        city_id = cursor.fetchone()[0]
 
         cursor.execute(
             """
@@ -208,8 +253,10 @@ def save_data_to_postgres(ti):
             ),
         )
 
-    conn.commit()
-    cursor.close()
+        conn.commit()
+        cursor.close()
+    except Exception as e:
+        print(f"Ошибка: {e}")
 
 
 args = {
@@ -220,11 +267,11 @@ args = {
     # 'provide_context': True
 }
 with DAG(
-        "test_de_airf",
-        description="test1",
-        schedule_interval="*/1 * * * *",
-        catchup=False,  # TODO
-        default_args=args,
+    "test_de_airf",
+    description="test1",
+    schedule_interval="*/1 * * * *",
+    catchup=False,
+    default_args=args,
 ) as dag:
     get_users = PythonOperator(
         task_id="get_user",
